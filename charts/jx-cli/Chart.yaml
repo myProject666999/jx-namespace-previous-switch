@@ -1,0 +1,12 @@
+apiVersion: v2
+name: jx
+description: JayeX next gen cloud CI / CD platform for Kubernetes
+home: https://jayex.io/
+version: 0.0.1
+appVersion: 3.0.0
+icon: https://jenkins-x.github.io/jenkins-x-website/img/profile.png
+sources:
+- https://github.com/jenkins-x/jx
+maintainers:
+- name: JayeX Team
+  email: jayex@cd.foundation

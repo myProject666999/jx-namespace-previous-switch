@@ -1,0 +1,67 @@
+apiVersion: updatebot.jenkins-x.io/v1alpha1
+kind: UpdateConfig
+spec:
+  pullRequestLabels:
+  - dependency/jx
+  rules:
+    - urls:
+        - https://github.com/jenkins-x/jx3-pipeline-catalog
+      sparseCheckout: true
+      changes:
+        - regex:
+            pattern: "jenkins-x/jx:(.*)"
+            files:
+              - "**/*.yaml"
+        - regex:
+            pattern: "jenkins-x/jx-boot:(.*)"
+            files:
+              - "**/*.yaml"
+    - urls:
+        - https://github.com/jenkins-x/jx3-versions
+      reusePullRequest: true
+      sparseCheckout: true
+      changes:
+        - versionTemplate: |
+            {{ pullRequestSha "jenkins-x/jx3-pipeline-catalog" }}
+          regex:
+            pattern: "version: (.*)"
+            files:
+              - git/github.com/jenkins-x/jx3-pipeline-catalog.yml
+        - regex:
+            pattern: "\\s+image: ghcr.io/jenkins-x/jx:(.*)"
+            files:
+              - ".lighthouse/jenkins-x/release.yaml"
+              - ".lighthouse/jenkins-x/pullrequest*.yaml"
+              - "jenkins-x-*.yml"
+              - "git-operator/job.yaml"
+        - regex:
+            pattern: "\\s+image: ghcr.io/jenkins-x/jx-boot:(.*)"
+            files:
+              - ".lighthouse/jenkins-x/release.yaml"
+              - ".lighthouse/jenkins-x/pullrequest*.yaml"
+              - "jenkins-x-*.yml"
+              - "git-operator/job*.yaml"
+        - regex:
+            pattern: "version: (.*)"
+            files:
+              - "docker/ghcr.io/jenkins-x/jx.yml"
+              - "packages/jx.yml"
+              - "packages/jx-cli.yml"
+        # - regex:
+        #     pattern: "terraformVersion: (.*)"
+        #     files:
+        #     - ".lighthouse/jenkins-x/bdd/*.yaml*"
+        - regex:
+            pattern: "JX_DEFAULT_IMAGE: ghcr.io/jenkins-x/jx:(.*)"
+            files:
+              - "apps/jenkins-x/lighthouse/values.yaml.gotmpl"
+              - "charts/jenkins-x/lighthouse/values.yaml.gotmpl"
+    - urls:
+        - https://github.com/jenkins-x-charts/jxboot-helmfile-resources
+      reusePullRequest: true
+      sparseCheckout: true
+      changes:
+        - regex:
+            pattern: "jx: (.*)"
+            files:
+              - "charts/jxboot-helmfile-resources/values.yaml"

@@ -1,0 +1,57 @@
+apiVersion: tekton.dev/v1beta1
+kind: PipelineRun
+metadata:
+  creationTimestamp: null
+  name: pullrequest
+spec:
+  pipelineSpec:
+    tasks:
+    - name: from-build-pack
+      resources: {}
+      taskSpec:
+        metadata: {}
+        stepTemplate:
+          image: uses:jenkins-x/jx3-pipeline-catalog/tasks/go-plugin/pullrequest.yaml@versionStream
+          name: ""
+          resources: {}
+          workingDir: /workspace/source
+        steps:
+        - image: uses:jenkins-x/jx3-pipeline-catalog/tasks/git-clone/git-clone-pr.yaml@versionStream
+          name: ""
+          resources: {}
+        - name: jx-variables
+          resources: {}
+        - name: build-make-linux
+          resources: {}
+          env:
+          - name: GOTOOLCHAIN
+            value: go1.26.3
+        # Move to catalog
+        - image: golang:1.26.3-alpine3.23@sha256:91eda9776261207ea25fd06b5b7fed8d397dd2c0a283e77f2ab6e91bfa71079d
+          name: coverage-report
+          resources: {}
+          script: |
+            #!/bin/sh
+            source .jx/variables.sh
+            apk add --update make bash curl gnupg coreutils
+            make test-coverage
+            curl https://keybase.io/codecovsecurity/pgp_keys.asc | gpg --no-default-keyring --keyring trustedkeys.gpg --import
+            # Pin it to 0.2.4, seeing an error with slug in 0.2.5
+            curl -Os https://uploader.codecov.io/v0.2.4/alpine/codecov
+            curl -Os https://uploader.codecov.io/0.2.4/alpine/codecov.SHA256SUM
+            curl -Os https://uploader.codecov.io/0.2.4/alpine/codecov.SHA256SUM.sig
+            gpgv codecov.SHA256SUM.sig codecov.SHA256SUM
+            sha256sum -c codecov.SHA256SUM
+            chmod +x codecov
+            ./codecov -Z -B ${PR_HEAD_REF} -r jenkins-x/jx -C ${PULL_PULL_SHA} -t ${CODECOV_TOKEN} -R . -f ./build/reports/cover.txt
+          env:
+          - name: CODECOV_TOKEN
+            valueFrom:
+              secretKeyRef:
+                name: codecov
+                key: token
+                optional: true
+  podTemplate: {}
+  serviceAccountName: tekton-bot
+  timeout: 1h0m
+status: {}
