@@ -17,6 +17,9 @@ jx\-namespace \- View or change the current namespace context in the current Kub
 .PP
 Displays or changes the current namespace.
 
+.PP
+The previously selected namespace is recorded per kube context in the context's "previous\-ns.jayex.io" extension, so "jx ns \-" returns to the namespace that was last used with the current kube context. Switching to another kube context and back therefore does not change where "jx ns \-" goes.
+
 
 .SH OPTIONS
 .PP
@@ -74,7 +77,7 @@ Displays or changes the current namespace.
   jx ns \-\-pick
 
 .PP
-# change to the previously selected namespace
+# change to the previously selected namespace in the current kube context
   jx ns \-
 
 

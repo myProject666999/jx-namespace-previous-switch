@@ -2,8 +2,8 @@ package namespace
 
 import (
 	"context"
+	"errors"
 	"fmt"
-	"os"
 	"sort"
 	"strings"
 
@@ -45,12 +45,35 @@ type Options struct {
 	Create     bool
 	QuiteMode  bool
 	BatchMode  bool
+
+	// ConfigAccess is the kubeconfig accessor used to read and update the current context.
+	// If nil the default client-go path options are used (the KUBECONFIG environment
+	// variable or ~/.kube/config). Tests can inject an accessor backed by a temporary
+	// file so the kubeconfig can be read and written without touching the process
+	// environment or the user's real kubeconfig.
+	ConfigAccess clientcmd.ConfigAccess
 }
 
+// ErrNamespaceSkipped is returned by Run when the target namespace does not exist and
+// --quiet was given. Nothing has been changed and the command should exit successfully;
+// callers decide how to translate that into a process exit code so that Run itself
+// never terminates the process.
+var ErrNamespaceSkipped = errors.New("namespace does not exist, skipping")
+
 var (
+	// configExtension is the key in the kube context's extensions which holds the
+	// previously selected namespace. The key name and the JSON encoding of the value
+	// (a JSON string) are part of the on-disk format: changing them would lose the
+	// records written by older releases.
 	configExtension = "previous-ns.jayex.io"
-	cmdLong         = templates.LongDesc(`
-		Displays or changes the current namespace.`)
+
+	cmdLong = templates.LongDesc(`
+		Displays or changes the current namespace.
+
+		The previously selected namespace is recorded per kube context in the context's
+		"previous-ns.jayex.io" extension, so "jx ns -" returns to the namespace that was
+		last used with the *current* kube context. Switching to another kube context and
+		back therefore does not change where "jx ns -" goes.`)
 	cmdExample = templates.Examples(`
 		# view the current namespace
 		jx --batch-mode ns
@@ -73,9 +96,8 @@ var (
 		# interactively select the Environment to switch to
 		jx ns --pick
 
-		# change to the previously selected namespace
-		jx ns -
-`)
+		# change to the previously selected namespace in the current kube context
+		jx ns -`)
 
 	info = termcolor.ColorInfo
 )
@@ -111,6 +133,12 @@ func NewCmdNamespace() (*cobra.Command, *Options) {
 		Run: func(_ *cobra.Command, args []string) {
 			o.Args = args
 			err := o.Run()
+			if errors.Is(err, ErrNamespaceSkipped) {
+				// --quiet: the namespace does not exist. Report nothing else and exit
+				// successfully, which is the behaviour callers relied on when this used
+				// to be an os.Exit(0) inside the command.
+				return
+			}
 			helper.CheckErr(err)
 		},
 	}
@@ -125,22 +153,35 @@ func NewCmdNamespace() (*cobra.Command, *Options) {
 
 // Run implements the command
 func (o *Options) Run() error {
-	var err error
-	currentNS := ""
-	o.KubeClient, currentNS, err = kube.LazyCreateKubeClientAndNamespace(o.KubeClient, "")
+	cfg, configAccess, err := o.loadConfig()
 	if err != nil {
-		return fmt.Errorf("creating kubernetes client: %w", err)
+		return err
 	}
-	client := o.KubeClient
 
-	f := kubeclient.NewFactory()
-	config, err := f.CreateKubeConfig()
-	if err != nil {
-		return fmt.Errorf("creating kubernetes configuration: %w", err)
+	currentNS := ""
+	if ctx := kube.CurrentContext(cfg); ctx != nil {
+		currentNS = ctx.Namespace
 	}
-	cfg, pathOptions, err := kubeclient.LoadConfig()
-	if err != nil {
-		return fmt.Errorf("loading Kubernetes configuration: %w", err)
+
+	client := o.KubeClient
+	if o.ConfigAccess == nil {
+		// Production path: let the helper create the client and, when the kubeconfig
+		// context has no namespace, fall back to the in-pod namespace file (then
+		// "default"), which is what the command has always done.
+		var resolvedNS string
+		client, resolvedNS, err = kube.LazyCreateKubeClientAndNamespace(client, currentNS)
+		if err != nil {
+			return fmt.Errorf("creating kubernetes client: %w", err)
+		}
+		currentNS = resolvedNS
+	} else if client == nil {
+		return fmt.Errorf("no Kubernetes client was provided")
+	}
+	o.KubeClient = client
+
+	argNS := firstArg(o.Args)
+	if o.Env != "" && argNS != "" {
+		return fmt.Errorf("cannot use both --env and a namespace argument; remove either %q or --env", argNS)
 	}
 
 	ns := ""
@@ -150,25 +191,24 @@ func (o *Options) Run() error {
 			return fmt.Errorf("failed to find JayeX environment: %s: %w", o.Env, err)
 		}
 		if ns == "" {
+			// nothing was picked; nothing to change
 			return nil
 		}
-	}
-	if ns == "" {
-		ns = namespace(o)
-	}
-
-	if ns == "-" {
-		ctx := kube.CurrentContext(cfg)
-		if ext, ok := ctx.Extensions[configExtension].(*runtime.Unknown); ok {
-			err = json.Unmarshal(ext.Raw, &ns)
-			if err != nil {
-				log.Logger().WithError(err).Warnf("can't interpret previous namespace")
-			}
+	} else if argNS == "-" {
+		ns, err = o.previousNamespace(cfg, currentNS)
+		if err != nil {
+			return err
 		}
 		if ns == "" {
-			log.Logger().Warnf("no previous namespace was set")
+			// the recorded namespace no longer exists; previousNamespace already
+			// explained that and the current namespace is kept as is
+			o.logCurrentNamespace(cfg, currentNS)
+			return nil
 		}
+	} else {
+		ns = argNS
 	}
+
 	if ns == "" && !o.BatchMode {
 		ns, err = pickNamespace(o, client, currentNS)
 		if err != nil {
@@ -176,35 +216,92 @@ func (o *Options) Run() error {
 		}
 	}
 
-	if ns != "" && ns != currentNS {
-		ctx, err := changeNamespace(client, cfg, pathOptions, ns, o.Create, o.QuiteMode)
-		if err != nil {
-			return err
-		}
-		if ctx == nil {
-			log.Logger().Infof("No kube context - probably in a unit test or pod?\n")
-		} else {
-			log.Logger().Infof("Now using namespace '%s' on server '%s'.\n", info(ctx.Namespace), info(kube.Server(cfg, ctx)))
-		}
+	if ns == "" || ns == currentNS {
+		// Nothing to change. In particular do not rewrite the stored previous
+		// namespace when the requested namespace is the current one.
+		o.logCurrentNamespace(cfg, currentNS)
+		return nil
+	}
+
+	ctx, err := changeNamespace(client, cfg, configAccess, ns, o.Create, o.QuiteMode)
+	if err != nil {
+		return err
+	}
+	if ctx == nil {
+		log.Logger().Infof("No kube context - probably in a unit test or pod?\n")
 	} else {
-		if currentNS != "" {
-			ns = currentNS
-		}
-		server := kube.CurrentServer(cfg)
-		if config == nil {
-			log.Logger().Infof("Using namespace '%s' on server '%s'. No context - probably a unit test or pod?\n", info(ns), info(server))
-		} else {
-			log.Logger().Infof("Using namespace '%s' from context named '%s' on server '%s'.\n", info(ns), info(cfg.CurrentContext), info(server))
-		}
+		log.Logger().Infof("Now using namespace '%s' on server '%s'.\n", info(ctx.Namespace), info(kube.Server(cfg, ctx)))
 	}
 	return nil
 }
 
+// loadConfig loads the kubeconfig using the injected accessor when there is one and
+// the standard client-go locations otherwise.
+func (o *Options) loadConfig() (*api.Config, clientcmd.ConfigAccess, error) {
+	if o.ConfigAccess != nil {
+		cfg, err := o.ConfigAccess.GetStartingConfig()
+		if err != nil {
+			return nil, o.ConfigAccess, fmt.Errorf("loading Kubernetes configuration from %s: %w", o.ConfigAccess.GetDefaultFilename(), err)
+		}
+		return cfg, o.ConfigAccess, nil
+	}
+	cfg, pathOptions, err := kubeclient.LoadConfig()
+	if err != nil {
+		return nil, pathOptions, fmt.Errorf("loading Kubernetes configuration: %w", err)
+	}
+	return cfg, pathOptions, nil
+}
+
+// previousNamespace returns the namespace recorded for the current kube context.
+//
+// It returns an error when there is no current context (for example when running
+// inside a pod) or when no namespace has ever been selected for that context.
+// When the recorded namespace no longer exists it logs an explanation and returns an
+// empty namespace so the caller keeps the current namespace unchanged.
+func (o *Options) previousNamespace(cfg *api.Config, currentNS string) (string, error) {
+	ctx := kube.CurrentContext(cfg)
+	if ctx == nil {
+		return "", fmt.Errorf("cannot switch to the previous namespace: there is no current Kubernetes context (running inside a pod?)")
+	}
+
+	previous := ""
+	if ext, ok := ctx.Extensions[configExtension].(*runtime.Unknown); ok {
+		if err := json.Unmarshal(ext.Raw, &previous); err != nil {
+			return "", fmt.Errorf("can't interpret the previous namespace recorded for context %s: %w", cfg.CurrentContext, err)
+		}
+	}
+	if previous == "" {
+		return "", fmt.Errorf("no previous namespace was recorded for context %s; select one first with 'jx ns <namespace>'", cfg.CurrentContext)
+	}
+
+	_, err := o.KubeClient.CoreV1().Namespaces().Get(context.TODO(), previous, metav1.GetOptions{})
+	if err != nil {
+		if apierrors.IsNotFound(err) {
+			log.Logger().Warnf("the previously selected namespace %s no longer exists; keeping the current namespace %s", info(previous), info(currentNS))
+			return "", nil
+		}
+		return "", fmt.Errorf("checking the previously selected namespace %s: %w", previous, err)
+	}
+	return previous, nil
+}
+
+// logCurrentNamespace reports the namespace which is currently in use.
+func (o *Options) logCurrentNamespace(cfg *api.Config, ns string) {
+	server := kube.Server(cfg, kube.CurrentContext(cfg))
+	if kube.CurrentContext(cfg) == nil {
+		log.Logger().Infof("Using namespace '%s' on server '%s'. No context - probably a unit test or pod?\n", info(ns), info(server))
+	} else {
+		log.Logger().Infof("Using namespace '%s' from context named '%s' on server '%s'.\n", info(ns), info(cfg.CurrentContext), info(server))
+	}
+}
+
 func (o *Options) findNamespaceFromEnv(ns, name string) (string, error) {
 	var err error
-	o.JXClient, ns, err = jxclient.LazyCreateJXClientAndNamespace(o.JXClient, ns)
-	if err != nil {
-		return "", fmt.Errorf("failed to create jx client: %w", err)
+	if o.JXClient == nil || ns == "" {
+		o.JXClient, ns, err = jxclient.LazyCreateJXClientAndNamespace(o.JXClient, ns)
+		if err != nil {
+			return "", fmt.Errorf("failed to create jx client: %w", err)
+		}
 	}
 
 	names, err := o.GetEnvironmentNames(ns)
@@ -245,6 +342,9 @@ func (o *Options) findNamespaceFromEnv(ns, name string) (string, error) {
 		}
 		return "", fmt.Errorf("failed to load Environment %s in namespace %s: %w", name, ns, err)
 	}
+	if env.Spec.Namespace == "" {
+		return "", fmt.Errorf("Environment %s in namespace %s does not specify a namespace", name, ns)
+	}
 	return env.Spec.Namespace, nil
 }
 
@@ -260,76 +360,82 @@ func (o *Options) GetEnvironmentNames(ns string) ([]string, error) {
 	return names, err
 }
 
-func namespace(o *Options) string {
-	ns := ""
-	args := o.Args
-	if len(args) > 0 {
-		ns = args[0]
+// firstArg returns the first non-empty positional argument.
+func firstArg(args []string) string {
+	for _, arg := range args {
+		if arg != "" {
+			return arg
+		}
 	}
-	return ns
+	return ""
 }
 
-func changeNamespace(client kubernetes.Interface, config *api.Config, pathOptions clientcmd.ConfigAccess, ns string, create, quietMode bool) (*api.Context, error) {
-	_, err := client.CoreV1().Namespaces().Get(context.TODO(), ns, metav1.GetOptions{})
-	if err != nil {
-		switch err.(type) {
-		case *apierrors.StatusError:
-			err = handleStatusError(err, client, ns, create, quietMode)
-			if err != nil {
-				return nil, err
-			}
-		default:
-			return nil, fmt.Errorf("getting namespace %q: %w", ns, err)
-		}
+func changeNamespace(client kubernetes.Interface, config *api.Config, configAccess clientcmd.ConfigAccess, ns string, create, quietMode bool) (*api.Context, error) {
+	if err := ensureNamespaceExists(client, ns, create, quietMode); err != nil {
+		return nil, err
 	}
 	ctx := kube.CurrentContext(config)
 
 	if ctx == nil {
-		ctx = &api.Context{}
+		// There is no kube context (typically when running inside a pod). The switch
+		// only happens in memory: there is no context to record the previous
+		// namespace in and nothing is written to disk.
+		ctx = api.NewContext()
+		if config.Contexts == nil {
+			config.Contexts = map[string]*api.Context{}
+		}
 		name := "pod"
 		config.Contexts[name] = ctx
 		config.CurrentContext = name
-	} else {
-		jsonNs, err := json.Marshal(ctx.Namespace)
-		if err != nil {
-			log.Logger().WithError(err).Warnf("fail to store previous namespace in %s", pathOptions.GetDefaultFilename())
-		} else {
-			ctx.Extensions[configExtension] = &runtime.Unknown{
-				Raw:         jsonNs,
-				ContentType: runtime.ContentTypeJSON,
-			}
-		}
+		ctx.Namespace = ns
+		return ctx, nil
 	}
 
 	if ctx.Namespace == ns {
 		return ctx, nil
 	}
+
+	if ctx.Extensions == nil {
+		ctx.Extensions = map[string]runtime.Object{}
+	}
+	jsonNs, err := json.Marshal(ctx.Namespace)
+	if err != nil {
+		log.Logger().WithError(err).Warnf("fail to store previous namespace in %s", configAccess.GetDefaultFilename())
+	} else {
+		ctx.Extensions[configExtension] = &runtime.Unknown{
+			Raw:         jsonNs,
+			ContentType: runtime.ContentTypeJSON,
+		}
+	}
 	ctx.Namespace = ns
 
 	newConfig := *config
-	err = clientcmd.ModifyConfig(pathOptions, newConfig, false)
+	err = clientcmd.ModifyConfig(configAccess, newConfig, false)
 	if err != nil {
 		return nil, fmt.Errorf("failed to update the kube config %s", err)
 	}
 	return ctx, nil
 }
 
-func handleStatusError(err error, client kubernetes.Interface, ns string, create, quietMode bool) error {
-	statusErr, _ := err.(*apierrors.StatusError)
-	if statusErr.Status().Reason == metav1.StatusReasonNotFound {
-		if quietMode {
-			log.Logger().Infof("namespace %s does not exist yet", ns)
-			os.Exit(0)
-			return nil
-		}
-		if create {
-			err = createNamespace(client, ns)
-			if err != nil {
-				return err
-			}
-			return nil
-		}
-		return err
+// ensureNamespaceExists checks the target namespace, creating it if create is set.
+// When the namespace is missing, create takes precedence over quietMode: the user
+// explicitly asked for it to be created. With only quietMode set the returned error
+// is ErrNamespaceSkipped so the caller can exit successfully without terminating
+// the process from a library function.
+func ensureNamespaceExists(client kubernetes.Interface, ns string, create, quietMode bool) error {
+	_, err := client.CoreV1().Namespaces().Get(context.TODO(), ns, metav1.GetOptions{})
+	if err == nil {
+		return nil
+	}
+	if !apierrors.IsNotFound(err) {
+		return fmt.Errorf("getting namespace %q: %w", ns, err)
+	}
+	if create {
+		return createNamespace(client, ns)
+	}
+	if quietMode {
+		log.Logger().Infof("namespace %s does not exist yet", ns)
+		return ErrNamespaceSkipped
 	}
 	return err
 }
